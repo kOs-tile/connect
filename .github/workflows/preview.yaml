@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   preview:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
+    if: ${{ github.repository == 'commaai/connect' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -70,7 +70,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   preview-master:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master' }}
+    if: ${{ github.repository == 'commaai/connect' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master' }}
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
