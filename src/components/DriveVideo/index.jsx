@@ -6,29 +6,32 @@ import { api } from '../../api/backend';
 
 import Colors from '../../colors';
 import { ErrorOutline } from '../../icons';
-import { attachVideo, currentOffset, resumePosition, seekTo } from '../../timeline';
+import { attachVideo, bumpPlaybackEpoch, currentOffset, resumePosition, seekTo } from '../../timeline';
 import { pause, play, playbackChanged } from '../../timeline/playback';
 
 const NOT_UPLOADED = 'This video has not uploaded yet or has been deleted.';
 const NETWORK_ERROR = 'Unable to load video. Check network connection.';
 const LOAD_ERROR = 'Unable to load video.';
 
-// Safari, and every browser on iOS, plays HLS natively and reports audio tracks
-// itself. Everywhere else hls.js feeds the stream through Media Source Extensions.
+// Native HLS support does not imply support for the optional audioTracks API.
+// Do not send a native-HLS browser through the hls.js fallback for that reason.
 function playsHlsNatively(video) {
-  return Boolean(video.canPlayType('application/vnd.apple.mpegurl')) && 'audioTracks' in video;
+  return Boolean(video.canPlayType('application/vnd.apple.mpegurl'));
 }
 
 // Attaches the stream to the video element. Returns a function that detaches it.
 function loadStream(video, src, { onAudio, onError }) {
   if (playsHlsNatively(video)) {
+    const tracks = video.audioTracks;
     const reportAudio = () => onAudio(true);
     const reportError = () => onError(video.error?.code === MediaError.MEDIA_ERR_NETWORK ? NETWORK_ERROR : LOAD_ERROR);
-    video.audioTracks.addEventListener('addtrack', reportAudio);
+    tracks?.addEventListener?.('addtrack', reportAudio);
+    // Native HLS may expose audio playback without providing audioTracks.
+    onAudio(tracks ? tracks.length > 0 : true);
     video.addEventListener('error', reportError);
     video.src = src;
     return () => {
-      video.audioTracks.removeEventListener('addtrack', reportAudio);
+      tracks?.removeEventListener?.('addtrack', reportAudio);
       video.removeEventListener('error', reportError);
     };
   }
@@ -45,8 +48,12 @@ function loadStream(video, src, { onAudio, onError }) {
     }
     let recoveredMediaError = false;
     hls = new Hls({ maxBufferLength: 40 });
-    hls.on(Hls.Events.BUFFER_CODECS, (_event, data) => onAudio(Boolean(data.audio)));
+    hls.on(Hls.Events.BUFFER_CODECS, (_event, data) => {
+      if (!cancelled && hls) onAudio(Boolean(data.audio));
+    });
     hls.on(Hls.Events.ERROR, (_event, data) => {
+      // Late HLS events must never update a replacement route's playback state.
+      if (cancelled || !hls) return;
       if (!data.fatal) {
         return; // hls.js retries these itself
       }
@@ -65,11 +72,12 @@ function loadStream(video, src, { onAudio, onError }) {
     });
     hls.loadSource(src);
     hls.attachMedia(video);
-  }).catch(() => onError(NETWORK_ERROR));
+  }).catch(() => { if (!cancelled) onError(NETWORK_ERROR); });
 
   return () => {
     cancelled = true;
     hls?.destroy();
+    hls = null;
   };
 }
 
@@ -94,21 +102,34 @@ const VideoOverlay = ({ buffering, error, onRetry }) => {
 
 function DriveVideo({ dispatch, currentRoute, zoom, isPaused, isMuted, onAudioStatusChange }) {
   const videoRef = useRef(null);
+  const activeRouteRef = useRef(null);
+  const streamGenerationRef = useRef(0);
   const [buffering, setBuffering] = useState(true);
   const [error, setError] = useState(null);
   const [attempt, setAttempt] = useState(0);
 
   const { fullname, share_exp: shareExp, share_sig: shareSig, videoStartOffset = 0 } = currentRoute;
+  activeRouteRef.current = fullname;
 
-  const syncPlayback = () => dispatch(playbackChanged(videoRef.current));
+  const syncPlayback = (video = videoRef.current) => {
+    // Events from a detached media element must not control its replacement.
+    if (video && video === videoRef.current) {
+      dispatch(playbackChanged(video));
+    }
+  };
 
   useEffect(() => {
-    attachVideo(videoRef.current, videoStartOffset, zoom);
+    attachVideo(videoRef.current, videoStartOffset, zoom, fullname);
   });
-  useEffect(() => () => attachVideo(null), []);
+  useEffect(() => () => {
+    activeRouteRef.current = null;
+    attachVideo(null);
+  }, []);
 
   useEffect(() => {
     const video = videoRef.current;
+    const generation = (streamGenerationRef.current += 1);
+    bumpPlaybackEpoch();
     setError(null);
     onAudioStatusChange(false);
     const unload = loadStream(video, api.video.getQcameraStreamUrl(fullname, shareExp, shareSig), {
@@ -119,11 +140,17 @@ function DriveVideo({ dispatch, currentRoute, zoom, isPaused, isMuted, onAudioSt
       },
     });
     return () => {
-      const resumeAt = currentOffset();
+      // Invalidate pending play() promises even if a retry reuses the same DOM node.
+      if (streamGenerationRef.current === generation) (streamGenerationRef.current += 1);
+      bumpPlaybackEpoch();
+      // On a retry, retain the position. On a route change, NEVER replay the
+      // old route's time into the newly-attached playback clock.
+      const retryingSameRoute = activeRouteRef.current === fullname;
+      const resumeAt = retryingSameRoute ? currentOffset() : null;
       unload();
       video.removeAttribute('src');
       video.load();
-      seekTo(resumeAt); // held until a retried stream is ready
+      if (retryingSameRoute) seekTo(resumeAt);
     };
   }, [fullname, shareExp, shareSig, attempt]);
 
@@ -152,12 +179,20 @@ function DriveVideo({ dispatch, currentRoute, zoom, isPaused, isMuted, onAudioSt
     return () => cancelAnimationFrame(frame);
   }, [isPaused, zoom.start, zoom.end]);
 
-  const onLoadedMetadata = () => {
+  const onLoadedMetadata = (event) => {
+    const video = event.currentTarget;
+    if (video !== videoRef.current) return;
+    const generation = streamGenerationRef.current;
     resumePosition();
-    videoRef.current.play()?.catch(() => {
+    if (isPaused) return; // Explicit pause must survive metadata reload/retry.
+    video.play()?.catch(() => {
+      // A rejected promise may arrive after route switch, retry or unmount.
+      if (video !== videoRef.current
+        || generation !== streamGenerationRef.current
+        || activeRouteRef.current !== fullname) return;
       // autoplay refused: wait for the play button
       setBuffering(false);
-      syncPlayback();
+      syncPlayback(video);
     });
   };
 
@@ -169,7 +204,9 @@ function DriveVideo({ dispatch, currentRoute, zoom, isPaused, isMuted, onAudioSt
   return (
     <div className="min-h-[200px] relative max-w-[964px] m-[0_auto] aspect-[1.593]">
       <VideoOverlay buffering={buffering} error={error} onRetry={() => setAttempt((n) => n + 1)} />
+      {/* New routes must not inherit media decoder state or stale video events. */}
       <video
+        key={fullname}
         ref={videoRef}
         className="w-full h-full"
         playsInline
@@ -183,9 +220,9 @@ function DriveVideo({ dispatch, currentRoute, zoom, isPaused, isMuted, onAudioSt
         onSeeked={() => setBuffering(false)}
         onCanPlay={() => setBuffering(false)}
         onPlaying={() => setBuffering(false)}
-        onPlay={syncPlayback}
-        onPause={syncPlayback}
-        onRateChange={syncPlayback}
+        onPlay={(event) => syncPlayback(event.currentTarget)}
+        onPause={(event) => syncPlayback(event.currentTarget)}
+        onRateChange={(event) => syncPlayback(event.currentTarget)}
         onTimeUpdate={keepInRange}
         onEnded={onEnded}
       />

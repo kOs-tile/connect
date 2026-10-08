@@ -108,6 +108,22 @@ describe('playback controls', () => {
     await vi.waitFor(() => expect(dispatch).toHaveBeenCalledWith(playbackChanged(video)));
   });
 
+  it('ignores rejected play commands from a video that is no longer active', async () => {
+    let rejectPlay;
+    const oldVideo = fakeVideo({ play: vi.fn(() => new Promise((_resolve, reject) => { rejectPlay = reject; })) });
+    const nextVideo = fakeVideo({ paused: false });
+    const dispatch = vi.fn();
+
+    attachVideo(oldVideo, 0, range, 'route-A');
+    play()(dispatch);
+    attachVideo(nextVideo, 0, range, 'route-B');
+    rejectPlay(new Error('NotAllowedError'));
+
+    await vi.waitFor(() => expect(oldVideo.play).toHaveBeenCalledOnce());
+    await Promise.resolve();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it('ignores commands without a video', () => {
     expect(() => play()(vi.fn())).not.toThrow();
     expect(() => pause()(vi.fn())).not.toThrow();

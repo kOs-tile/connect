@@ -5,7 +5,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 
 import DriveVideo from '.';
 import { currentOffset, seekTo } from '../../timeline';
-import { reducer as playbackReducer } from '../../timeline/playback';
+import { play as playbackPlay, reducer as playbackReducer } from '../../timeline/playback';
 
 const hls = vi.hoisted(() => ({ instances: [] }));
 
@@ -41,8 +41,14 @@ const route = {
 };
 
 function renderVideo({ zoom = { start: 10000, end: 40000 }, onAudioStatusChange = vi.fn() } = {}) {
+  const reducer = (state, action) => {
+    if (action.type === 'TEST_ROUTE_SWITCH') {
+      return { ...state, currentRoute: action.route, zoom: action.zoom };
+    }
+    return playbackReducer(state, action);
+  };
   const store = Redux.createStore(
-    playbackReducer,
+    reducer,
     { currentRoute: route, zoom, isPaused: false, playSpeed: 1 },
     Redux.applyMiddleware(thunk),
   );
@@ -139,5 +145,155 @@ describe('DriveVideo', () => {
 
     stream.emit('error', { fatal: true, type: 'mediaError' });
     expect(screen.getByText('Unable to load video.')).toBeInTheDocument();
+  });
+
+  it('ignores late HLS events after the stream is unmounted', async () => {
+    const { unmount, onAudioStatusChange } = renderVideo();
+    const stream = await loadedStream();
+    const before = onAudioStatusChange.mock.calls.length;
+
+    unmount();
+    stream.emit('bufferCodecs', { audio: {} });
+    stream.emit('error', { fatal: true, type: 'networkError', response: { code: 404 } });
+
+    expect(onAudioStatusChange).toHaveBeenCalledTimes(before);
+    expect(stream.destroy).toHaveBeenCalledOnce();
+  });
+
+  it('does not restore a stale error after activating a replacement stream', async () => {
+    const { onAudioStatusChange } = renderVideo();
+    const previous = await loadedStream();
+    previous.emit('error', { fatal: true, type: 'networkError', response: { code: 404 } });
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await vi.waitFor(() => expect(hls.instances).toHaveLength(2));
+    const audioCalls = onAudioStatusChange.mock.calls.length;
+
+    previous.emit('bufferCodecs', { audio: {} });
+    previous.emit('error', { fatal: true, type: 'networkError', response: { code: 404 } });
+
+    expect(onAudioStatusChange).toHaveBeenCalledTimes(audioCalls);
+    expect(screen.queryByText(/has not uploaded/)).not.toBeInTheDocument();
+  });
+
+  it('does not autoplay when the user paused before metadata finished loading', async () => {
+    const { video, store } = renderVideo();
+    await loadedStream();
+    act(() => store.dispatch({ type: 'ACTION_PLAYBACK_STATE', isPaused: true, playSpeed: 1 }));
+
+    video.readyState = HTMLMediaElement.HAVE_METADATA;
+    fireEvent.loadedMetadata(video);
+    expect(video.play).not.toHaveBeenCalled();
+  });
+
+  it('plays native HLS when the optional audioTracks API is absent', () => {
+    const native = vi.spyOn(HTMLMediaElement.prototype, 'canPlayType')
+      .mockReturnValue('probably');
+    // Explicitly model native-HLS browsers without HTMLMediaElement.audioTracks.
+    // jsdom can expose an empty audioTracks collection, which tests another path.
+    const previous = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'audioTracks');
+    Object.defineProperty(HTMLVideoElement.prototype, 'audioTracks', {
+      configurable: true, value: undefined,
+    });
+    try {
+      const { video, onAudioStatusChange } = renderVideo();
+      expect(video.audioTracks).toBeUndefined();
+      expect(video.src).toContain('qcamera.m3u8');
+      expect(hls.instances).toHaveLength(0);
+      expect(onAudioStatusChange).toHaveBeenLastCalledWith(true);
+    } finally {
+      if (previous) Object.defineProperty(HTMLVideoElement.prototype, 'audioTracks', previous);
+      else delete HTMLVideoElement.prototype.audioTracks;
+      native.mockRestore();
+    }
+  });
+
+  it('ignores a delayed play rejection after the video component unmounts', async () => {
+    const { video, store, unmount } = renderVideo();
+    await loadedStream();
+    let rejectPlay;
+    video.play = vi.fn(() => new Promise((_resolve, reject) => { rejectPlay = reject; }));
+    video.readyState = HTMLMediaElement.HAVE_METADATA;
+    fireEvent.loadedMetadata(video);
+    expect(rejectPlay).toBeTypeOf('function');
+
+    unmount();
+    await act(async () => {
+      rejectPlay(new Error('NotAllowedError'));
+      await Promise.resolve();
+    });
+    // The obsolete promise must not dispatch or dereference a detached video.
+    expect(store.getState().isPaused).toBe(false);
+  });
+
+  it('ignores route A autoplay rejection after route B has become active', async () => {
+    const { video, store, container } = renderVideo();
+    await loadedStream();
+    let rejectPlay;
+    video.play = vi.fn(() => new Promise((_resolve, reject) => { rejectPlay = reject; }));
+    video.readyState = HTMLMediaElement.HAVE_METADATA;
+    fireEvent.loadedMetadata(video);
+    expect(rejectPlay).toBeTypeOf('function');
+
+    await act(async () => {
+      store.dispatch({
+        type: 'TEST_ROUTE_SWITCH',
+        route: { ...route, fullname: '0000aaaa0000aaaa|2026-08-06--13-00-00' },
+        zoom: { start: 3000, end: 20000 },
+      });
+      await Promise.resolve();
+    });
+    const replacement = container.querySelector('video');
+    expect(replacement).not.toBe(video);
+
+    await act(async () => {
+      rejectPlay(new Error('NotAllowedError'));
+      await Promise.resolve();
+    });
+    // An old video failure cannot mark the newly selected drive as paused.
+    expect(store.getState().isPaused).toBe(false);
+  });
+
+  it('ignores a delayed play rejection from an obsolete same-route retry', async () => {
+    const { video, store } = renderVideo();
+    const oldStream = await loadedStream();
+    let rejectPlay;
+    video.play = vi.fn(() => new Promise((_resolve, reject) => { rejectPlay = reject; }));
+    video.readyState = HTMLMediaElement.HAVE_METADATA;
+    fireEvent.loadedMetadata(video);
+    expect(rejectPlay).toBeTypeOf('function');
+
+    oldStream.emit('error', { fatal: true, type: 'networkError', response: { code: 404 } });
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await vi.waitFor(() => expect(hls.instances).toHaveLength(2));
+    // The fatal error legitimately paused the old video. Model the user
+    // resuming playback before the obsolete play() rejection arrives.
+    act(() => store.dispatch({ type: 'ACTION_PLAYBACK_STATE', isPaused: false, playSpeed: 1 }));
+    expect(store.getState().isPaused).toBe(false);
+
+    await act(async () => {
+      rejectPlay(new Error('NotAllowedError'));
+      await Promise.resolve();
+    });
+    expect(store.getState().isPaused).toBe(false);
+  });
+
+  it('ignores a delayed toolbar play rejection after retry of the same route', async () => {
+    const { video, store } = renderVideo();
+    const oldStream = await loadedStream();
+    let rejectPlay;
+    video.play = vi.fn(() => new Promise((_resolve, reject) => { rejectPlay = reject; }));
+    store.dispatch(playbackPlay());
+    expect(rejectPlay).toBeTypeOf('function');
+
+    oldStream.emit('error', { fatal: true, type: 'networkError', response: { code: 404 } });
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await vi.waitFor(() => expect(hls.instances).toHaveLength(2));
+    act(() => store.dispatch({ type: 'ACTION_PLAYBACK_STATE', isPaused: false, playSpeed: 1 }));
+
+    await act(async () => {
+      rejectPlay(new Error('NotAllowedError'));
+      await Promise.resolve();
+    });
+    expect(store.getState().isPaused).toBe(false);
   });
 });
