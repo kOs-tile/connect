@@ -7,6 +7,8 @@
 
 const clock = {
   video: null,
+  routeKey: null, // Keep pending seeks scoped to their source route.
+  playbackEpoch: 0, // Invalidate delayed play commands when the stream changes.
   videoStartOffset: 0,
   range: null,         // { start, end } the playhead is kept within
   pendingOffset: null, // a seek requested before the video could take it
@@ -17,11 +19,13 @@ function canSeek() {
 }
 
 // Called by DriveVideo whenever its element, route or selected range changes.
-export function attachVideo(video, videoStartOffset = 0, range = null) {
-  if (video !== clock.video) {
+export function attachVideo(video, videoStartOffset = 0, range = null, routeKey = null) {
+  if (video !== clock.video || routeKey !== clock.routeKey) {
     clock.pendingOffset = null;
+    clock.playbackEpoch += 1;
   }
   clock.video = video;
+  clock.routeKey = routeKey;
   clock.videoStartOffset = videoStartOffset;
   clock.range = range;
 }
@@ -56,6 +60,15 @@ export function seekTo(offset) {
 // been reporting while it loaded.
 export function resumePosition() {
   seekTo(clock.pendingOffset ?? clock.range?.start ?? 0);
+}
+
+// A source retry can reuse the same <video> element and route identity.
+export function bumpPlaybackEpoch() {
+  clock.playbackEpoch += 1;
+}
+
+export function getPlaybackEpoch() {
+  return clock.playbackEpoch;
 }
 
 export function getVideo() {

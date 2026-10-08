@@ -2,7 +2,7 @@
 // mirrors what the element reports back, so the UI always shows what is
 // actually playing.
 import * as Types from '../actions/types';
-import { getVideo, seekTo } from '.';
+import { getPlaybackEpoch, getVideo, seekTo } from '.';
 
 export function reducer(state, action) {
   if (action.type === Types.ACTION_PLAYBACK_STATE) {
@@ -41,8 +41,14 @@ export function play(speed) {
     if (speed) {
       video.playbackRate = speed;
     }
-    // a refused play() (e.g. autoplay policy) leaves the element paused, so resync
-    video.play()?.catch(() => dispatch(playbackChanged(video)));
+    // A refused play() leaves the element paused. Only resync if the same
+    // video AND the same media source are still active.
+    const epoch = getPlaybackEpoch();
+    video.play()?.catch(() => {
+      if (getVideo() === video && getPlaybackEpoch() === epoch) {
+        dispatch(playbackChanged(video));
+      }
+    });
   };
 }
 
